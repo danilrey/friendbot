@@ -6,7 +6,7 @@ from typing import Optional
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import Message,InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 import asyncpg
 from openai import OpenAI
@@ -20,9 +20,9 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:0000@localhost:5432/friendbot")
 
-FREE_LIMIT = int(os.getenv("FREE_LIMIT", 5))
-SUB_DURATION_DAYS = int(os.getenv("SUB_DURATION_DAYS", 30))
-MAX_HISTORY = int(os.getenv("MAX_HISTORY", 10))  # сколько последних сообщений хранить в контексте
+FREE_LIMIT = int(os.getenv("FREE_LIMIT"))
+SUB_DURATION_DAYS = int(os.getenv("SUB_DURATION_DAYS"))
+MAX_HISTORY = int(os.getenv("MAX_HISTORY"))  # сколько последних сообщений хранить в контексте
 
 SYSTEM_PROMPT = (
     "Ты милая девушка, поддерживающая разговор. Будь доброй, позитивной, тактичной, без 18+."
@@ -52,6 +52,10 @@ async def init_db(pool: asyncpg.pool.Pool) -> None:
         await conn.execute(USERS_SQL)
         await conn.execute(MESSAGES_SQL)
 
+async def set_persona(pool: asyncpg.pool.Pool, user_id: int, persona: str):
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE users SET persona=$1 WHERE user_id=$2", persona, user_id)
+
 async def get_user(pool: asyncpg.pool.Pool, user_id: int) -> asyncpg.Record:
     async with pool.acquire() as conn:
         rec = await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
@@ -61,6 +65,14 @@ async def get_user(pool: asyncpg.pool.Pool, user_id: int) -> asyncpg.Record:
             )
             rec = await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
         return rec
+
+def persona_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="👩 Девушка", callback_data="persona_girl"),
+            InlineKeyboardButton(text="👨 Парень", callback_data="persona_boy"),
+        ]
+    ])
 
 async def set_free_count(pool: asyncpg.pool.Pool, user_id: int, count: int) -> None:
     async with pool.acquire() as conn:
@@ -90,22 +102,43 @@ async def get_history(pool, user_id: int, limit: int = MAX_HISTORY):
         )
         return list(reversed(rows))
 
+async def trim_history(pool, user_id: int, limit: int = MAX_HISTORY * 2):
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            DELETE FROM messages
+            WHERE user_id = $1
+              AND id IN (
+                  SELECT id FROM messages
+                  WHERE user_id = $1
+                  ORDER BY id DESC
+                  OFFSET $2
+              )
+        """, user_id, limit)
+
 # -------------------- OpenRouter (DeepSeek) --------------------
+async def get_persona_prompt(pool, user_id: int) -> str:
+    rec = await get_user(pool, user_id)
+    persona = rec["persona"] or "girl"
+
+    if persona == "girl":
+        return "Ты милая девушка, поддерживающая разговор. Будь доброй, позитивной, тактичной, без 18+."
+    else:
+        return "Ты умный и добрый парень, поддерживающий разговор. Будь дружелюбным, тактичным, без 18+."
+
+
 class GPT:
     def __init__(self, api_key: str):
-        self.client = OpenAI(
-            api_key=api_key,
-            base_url="https://openrouter.ai/api/v1"
-        )
+        self.client = OpenAI(api_key=api_key, base_url="https://openrouter.ai/api/v1")
 
-    async def reply(self, history: list, user_text: str) -> str:
+    async def reply(self, user_text: str, system_prompt: str, history: list) -> str:
         def _call() -> str:
-            messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history + [
-                {"role": "user", "content": user_text}
-            ]
             resp = self.client.chat.completions.create(
-                model="deepseek/deepseek-r1:free",
-                messages=messages,
+                model="deepseek/deepseek-r1-0528-qwen3-8b:free",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    *history,
+                    {"role": "user", "content": user_text},
+                ],
             )
             return resp.choices[0].message.content
         return await asyncio.to_thread(_call)
@@ -128,9 +161,19 @@ async def main() -> None:
         await get_user(pool, message.from_user.id)
         await message.answer(
             "Привет 👋 Я виртуальная подруга!\n"
-            f"У тебя {FREE_LIMIT} бесплатных сообщений.\n"
-            "Чтобы продолжить потом — оформи подписку /subscribe"
+            f"Выбери, кто будет с тобой общаться:",
+            reply_markup=persona_keyboard()
         )
+
+    @router.callback_query(F.data.startswith("persona_"))
+    async def cb_persona(callback: CallbackQuery):
+        persona = callback.data.split("_", 1)[1]  # "girl" или "boy"
+        await set_persona(pool, callback.from_user.id, persona)
+        if persona == "girl":
+            await callback.message.edit_text("✅ Теперь я твоя виртуальная подруга 👩")
+        else:
+            await callback.message.edit_text("✅ Теперь я твой виртуальный друг 👨")
+        await callback.answer()
 
     @router.message(Command("subscribe"))
     async def cmd_subscribe(message: Message):
@@ -147,19 +190,31 @@ async def main() -> None:
         history = await get_history(pool, user_id)
         history = [dict(r) for r in history]
 
+        system_prompt = await get_persona_prompt(pool, user_id)
+
         if has_active_sub(rec):
-            reply = await gpt.reply(history, message.text)
+            reply = await gpt.reply(
+                user_text=message.text,
+                system_prompt=system_prompt,
+                history=history
+            )
             await save_message(pool, user_id, "user", message.text)
             await save_message(pool, user_id, "assistant", reply)
-            await message.answer(reply)
+            await trim_history(pool, user_id)
+            await message.answer(reply, parse_mode=None)
             return
 
         free_count = rec["free_count"] or 0
         if free_count < FREE_LIMIT:
-            reply = await gpt.reply(history, message.text)
+            reply = await gpt.reply(
+                user_text=message.text,
+                system_prompt=system_prompt,
+                history=history
+            )
             await set_free_count(pool, user_id, free_count + 1)
             await save_message(pool, user_id, "user", message.text)
             await save_message(pool, user_id, "assistant", reply)
+            await trim_history(pool, user_id)
             await message.answer(f"(Бесплатно) {reply}")
         else:
             await message.answer("🔒 Бесплатные сообщения закончились!\nОформи подписку 👉 /subscribe")
